@@ -1,0 +1,1 @@
+"""FinPilot backend application package."""
