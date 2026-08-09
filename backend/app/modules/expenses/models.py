@@ -1,13 +1,19 @@
 """SQLAlchemy models for the expenses module."""
 
+from __future__ import annotations
+
 import uuid
 from datetime import datetime
 from decimal import Decimal
+from typing import TYPE_CHECKING
 
 from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, Numeric, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
+
+if TYPE_CHECKING:
+    from app.modules.auth.models import User
 
 
 class Expense(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -28,4 +34,4 @@ class Expense(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     spent_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
-    user: Mapped["User"] = relationship(back_populates="expenses")
+    user: Mapped[User] = relationship(back_populates="expenses")

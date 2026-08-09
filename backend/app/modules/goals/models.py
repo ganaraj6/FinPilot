@@ -1,13 +1,19 @@
 """SQLAlchemy models for the goals module."""
 
+from __future__ import annotations
+
 import uuid
 from datetime import date, datetime
 from decimal import Decimal
+from typing import TYPE_CHECKING
 
 from sqlalchemy import CheckConstraint, Date, DateTime, ForeignKey, Numeric, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database.base import Base, SoftDeleteMixin, TimestampMixin, UUIDPrimaryKeyMixin
+
+if TYPE_CHECKING:
+    from app.modules.auth.models import User
 
 
 class Goal(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
@@ -34,8 +40,8 @@ class Goal(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     target_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     status: Mapped[str] = mapped_column(String(20), default="active", index=True, nullable=False)
 
-    user: Mapped["User"] = relationship(back_populates="goals")
-    contributions: Mapped[list["GoalContribution"]] = relationship(
+    user: Mapped[User] = relationship(back_populates="goals")
+    contributions: Mapped[list[GoalContribution]] = relationship(
         back_populates="goal",
         cascade="all, delete-orphan",
         passive_deletes=True,
@@ -46,9 +52,7 @@ class GoalContribution(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     """A single amount contributed toward a goal."""
 
     __tablename__ = "goal_contributions"
-    __table_args__ = (
-        CheckConstraint("amount > 0", name="amount_positive"),
-    )
+    __table_args__ = (CheckConstraint("amount > 0", name="amount_positive"),)
 
     goal_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("goals.id", ondelete="CASCADE"),
@@ -63,4 +67,4 @@ class GoalContribution(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         nullable=False,
     )
 
-    goal: Mapped["Goal"] = relationship(back_populates="contributions")
+    goal: Mapped[Goal] = relationship(back_populates="contributions")

@@ -1,14 +1,19 @@
 """SQLAlchemy models for the health_score module."""
 
+from __future__ import annotations
+
 import uuid
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, SmallInteger
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
+
+if TYPE_CHECKING:
+    from app.modules.auth.models import User
 
 
 class HealthScoreSnapshot(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -28,4 +33,4 @@ class HealthScoreSnapshot(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     breakdown: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
-    user: Mapped["User"] = relationship(back_populates="health_score_snapshots")
+    user: Mapped[User] = relationship(back_populates="health_score_snapshots")

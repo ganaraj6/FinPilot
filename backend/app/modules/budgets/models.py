@@ -1,13 +1,19 @@
 """SQLAlchemy models for the budgets module."""
 
+from __future__ import annotations
+
 import uuid
 from datetime import date
 from decimal import Decimal
+from typing import TYPE_CHECKING
 
 from sqlalchemy import CheckConstraint, Date, ForeignKey, Numeric, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
+
+if TYPE_CHECKING:
+    from app.modules.auth.models import User
 
 
 class Budget(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -33,4 +39,4 @@ class Budget(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     period: Mapped[str] = mapped_column(String(20), default="monthly", nullable=False)
     starts_on: Mapped[date | None] = mapped_column(Date, nullable=True)
 
-    user: Mapped["User"] = relationship(back_populates="budgets")
+    user: Mapped[User] = relationship(back_populates="budgets")

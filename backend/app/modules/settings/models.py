@@ -1,11 +1,17 @@
 """SQLAlchemy models for the settings module."""
 
+from __future__ import annotations
+
 import uuid
+from typing import TYPE_CHECKING
 
 from sqlalchemy import Boolean, ForeignKey, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
+
+if TYPE_CHECKING:
+    from app.modules.auth.models import User
 
 
 class UserSettings(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -23,4 +29,4 @@ class UserSettings(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     weekly_report_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     email_notifications_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
-    user: Mapped["User"] = relationship(back_populates="user_settings")
+    user: Mapped[User] = relationship(back_populates="user_settings")
