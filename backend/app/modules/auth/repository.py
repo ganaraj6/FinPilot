@@ -28,9 +28,22 @@ class UserRepository(BaseRepository[User]):
         statement = select(User).where(User.id == user_id)
         return self._db.scalar(statement)
 
-    def get_by_email(self, email: str) -> User | None:
-        """Return the user with the exact email, or None if not found."""
+    def get_by_email(self, email: str, *, for_update: bool = False) -> User | None:
+        """Return the user with the exact email, or None if not found.
+
+        Args:
+            email: The email address to look up.
+            for_update: Whether to lock the matched row (SELECT ... FOR UPDATE)
+                until the end of the current transaction. The auth service uses
+                this during login to serialize authentication-state updates
+                against concurrent attempts.
+
+        Returns:
+            The matching user entity, or None.
+        """
         statement = select(User).where(User.email == email)
+        if for_update:
+            statement = statement.with_for_update()
         return self._db.scalar(statement)
 
     def exists_by_email(self, email: str) -> bool:
