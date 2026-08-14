@@ -35,3 +35,19 @@ class AccountLockedError(AuthenticationError):
 
 class InactiveAccountError(AuthenticationError):
     """Raised when a deactivated account attempts to authenticate."""
+
+
+class TokenError(AuthenticationError):
+    """Base class for JWT token creation and validation errors."""
+
+
+class InvalidTokenError(TokenError):
+    """Raised when a token is malformed, tampered, or fails claim validation."""
+
+
+class ExpiredTokenError(TokenError):
+    """Raised when a token's expiration time has already passed."""
+
+
+class InvalidTokenTypeError(TokenError):
+    """Raised when a token's type does not match the expected token type."""
