@@ -1,9 +1,11 @@
-"""Tests for the auth registration HTTP router.
+"""Tests for the auth HTTP router (registration and login).
 
 The router is tested end to end through Starlette's TestClient with the real
 ``get_auth_service`` dependency overridden by a fake, so no database is touched.
 The fake asserts that the router stays thin: requests are forwarded verbatim
 (normalization belongs to the service) and the router delegates to the service.
+Login additionally verifies the HttpOnly-cookie delivery of the access and
+refresh tokens and the mapping of authentication errors to HTTP status codes.
 
 The real ``app.main.app`` is imported so prefix composition (``/api/v1``) and
 router mounting are exercised exactly as in production.
@@ -21,13 +23,23 @@ import unittest
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest import mock
 
 os.environ["JWT_SECRET_KEY"] = "test-secret-key-for-auth-router-tests-0123456789"
+os.environ["ENVIRONMENT"] = "development"
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.core.exceptions import EmailAlreadyRegisteredError
+from app.config.settings import get_settings
+from app.core.exceptions import (
+    AccountLockedError,
+    EmailAlreadyRegisteredError,
+    InactiveAccountError,
+    InvalidCredentialsError,
+)
+from app.core.tokens import TokenType, validate_access_token, validate_refresh_token
 from app.main import app
+from app.modules.auth.cookies import ACCESS_TOKEN_COOKIE, REFRESH_TOKEN_COOKIE
 from app.modules.auth.router import get_auth_service
 from app.modules.auth.schemas import AuthenticatedUserResponse
 from app.modules.auth.service import AuthService
@@ -37,9 +49,15 @@ _HAS_HTTP_CLIENT = (
 )
 
 REGISTER_PATH = "/api/v1/auth/register"
+LOGIN_PATH = "/api/v1/auth/login"
 
 _PAYLOAD = {
     "full_name": "Test User",
+    "email": "user@example.com",
+    "password": "Password123!",
+}
+
+_LOGIN_PAYLOAD = {
     "email": "user@example.com",
     "password": "Password123!",
 }
@@ -61,6 +79,40 @@ def _registration_response(*, email="user@example.com"):
     )
 
 
+def _parse_cookie(header):
+    """Split a Set-Cookie header into name, value, and attribute dict."""
+    parts = [part.strip() for part in header.split(";")]
+    name, value = parts[0].split("=", 1)
+    attributes = {}
+    for part in parts[1:]:
+        if not part:
+            continue
+        if "=" in part:
+            key, _, raw_value = part.partition("=")
+            attributes[key.strip().lower()] = raw_value.strip()
+        else:
+            attributes[part.lower()] = True
+    return name, value, attributes
+
+
+def _cookie_map(response):
+    """Map cookie names to (value, attributes) from a response's Set-Cookie headers."""
+    cookies = {}
+    raw_headers = getattr(response, "raw_headers", None)
+    if raw_headers is not None:
+        headers = [
+            value.decode("latin-1")
+            for key, value in raw_headers
+            if key.decode("latin-1").lower() == "set-cookie"
+        ]
+    else:
+        headers = response.headers.get_list("set-cookie")
+    for header in headers:
+        name, value, attributes = _parse_cookie(header)
+        cookies[name] = (value, attributes)
+    return cookies
+
+
 class FakeAuthService:
     """Thin stand-in for AuthService used to isolate the router."""
 
@@ -68,6 +120,8 @@ class FakeAuthService:
         """Initialize the fake with empty call recording."""
         self.register_calls: list = []
         self.registration_error: Exception | None = None
+        self.login_calls: list = []
+        self.login_error: Exception | None = None
         self.last_response: AuthenticatedUserResponse | None = None
 
     def register(self, request):
@@ -75,6 +129,14 @@ class FakeAuthService:
         self.register_calls.append(request)
         if self.registration_error is not None:
             raise self.registration_error
+        self.last_response = _registration_response(email=str(request.email))
+        return self.last_response
+
+    def login(self, request):
+        """Record the request, then honor the configured error or return a profile."""
+        self.login_calls.append(request)
+        if self.login_error is not None:
+            raise self.login_error
         self.last_response = _registration_response(email=str(request.email))
         return self.last_response
 
@@ -169,6 +231,211 @@ class RegisterEndpointTests(unittest.TestCase):
         self.assertEqual(len(self.service.register_calls), 1)
 
 
+class LoginEndpointTests(unittest.TestCase):
+    """POST /api/v1/auth/login HTTP behaviour and cookie security."""
+
+    def setUp(self) -> None:
+        """Wire the fake service into the app and create a test client."""
+        self.service = FakeAuthService()
+        self.previous_override = app.dependency_overrides.get(get_auth_service)
+        app.dependency_overrides[get_auth_service] = lambda: self.service
+        self.client = TestClient(app, raise_server_exceptions=False)
+
+    def tearDown(self) -> None:
+        """Restore the original dependency override state."""
+        if self.previous_override is None:
+            app.dependency_overrides.pop(get_auth_service, None)
+        else:
+            app.dependency_overrides[get_auth_service] = self.previous_override
+
+    def _login(self):
+        """POST the login payload through the test client."""
+        return self.client.post(LOGIN_PATH, json=_LOGIN_PAYLOAD)
+
+    def test_login_returns_200(self):
+        """A successful login returns 200 OK."""
+        response = self._login()
+
+        self.assertEqual(response.status_code, 200)
+
+    def test_login_returns_authenticated_user_response(self):
+        """The login body is exactly the safe profile returned by the service."""
+        response = self._login()
+
+        self.assertEqual(response.json(), self.service.last_response.model_dump(mode="json"))
+
+    def test_login_sets_access_token_cookie(self):
+        """A successful login stores the access token in a cookie."""
+        response = self._login()
+
+        self.assertIn(ACCESS_TOKEN_COOKIE, _cookie_map(response))
+
+    def test_login_sets_refresh_token_cookie(self):
+        """A successful login stores the refresh token in a cookie."""
+        response = self._login()
+
+        self.assertIn(REFRESH_TOKEN_COOKIE, _cookie_map(response))
+
+    def test_access_token_cookie_is_httponly(self):
+        """The access-token cookie is not readable from JavaScript."""
+        _, attributes = _cookie_map(self._login())[ACCESS_TOKEN_COOKIE]
+
+        self.assertIs(attributes.get("httponly"), True)
+
+    def test_refresh_token_cookie_is_httponly(self):
+        """The refresh-token cookie is not readable from JavaScript."""
+        _, attributes = _cookie_map(self._login())[REFRESH_TOKEN_COOKIE]
+
+        self.assertIs(attributes.get("httponly"), True)
+
+    def test_cookie_samesite_is_lax(self):
+        """Both auth cookies are sent with SameSite=lax."""
+        cookies = _cookie_map(self._login())
+
+        for name in (ACCESS_TOKEN_COOKIE, REFRESH_TOKEN_COOKIE):
+            _, attributes = cookies[name]
+            self.assertEqual(attributes.get("samesite"), "lax")
+
+    def test_cookie_max_age_matches_token_lifetime(self):
+        """Cookie max-age mirrors the configured token lifetimes."""
+        settings = get_settings()
+        cookies = _cookie_map(self._login())
+
+        access_max_age = str(settings.access_token_expire_minutes * 60)
+        self.assertEqual(cookies[ACCESS_TOKEN_COOKIE][1].get("max-age"), access_max_age)
+
+        refresh_max_age = str(settings.refresh_token_expire_minutes * 60)
+        self.assertEqual(cookies[REFRESH_TOKEN_COOKIE][1].get("max-age"), refresh_max_age)
+
+    def test_development_cookies_do_not_require_https(self):
+        """Development cookies omit the Secure flag so plain HTTP works."""
+        cookies = _cookie_map(self._login())
+
+        for name in (ACCESS_TOKEN_COOKIE, REFRESH_TOKEN_COOKIE):
+            _, attributes = cookies[name]
+            self.assertNotIn("secure", attributes)
+
+    def test_production_cookies_require_https(self):
+        """Production cookies carry the Secure flag."""
+        settings = get_settings()
+        with mock.patch.object(settings, "environment", "production"):
+            cookies = _cookie_map(self._login())
+
+        for name in (ACCESS_TOKEN_COOKIE, REFRESH_TOKEN_COOKIE):
+            _, attributes = cookies[name]
+            self.assertIs(attributes.get("secure"), True)
+
+    def test_invalid_credentials_return_401(self):
+        """Invalid credentials map to 401 without revealing which field failed."""
+        self.service.login_error = InvalidCredentialsError()
+
+        response = self._login()
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json(), {"detail": "Invalid email or password"})
+
+    def test_locked_account_returns_423(self):
+        """A locked account maps to 423 without revealing the lock window."""
+        self.service.login_error = AccountLockedError()
+
+        response = self._login()
+
+        self.assertEqual(response.status_code, 423)
+        self.assertEqual(response.json(), {"detail": "Account is temporarily locked"})
+
+    def test_inactive_account_returns_403(self):
+        """An inactive account maps to 403 without revealing account state."""
+        self.service.login_error = InactiveAccountError()
+
+        response = self._login()
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json(), {"detail": "Account is inactive"})
+
+    def test_failed_login_sets_no_cookies(self):
+        """Failed authentication never attaches authentication cookies."""
+        for error in (InvalidCredentialsError(), AccountLockedError(), InactiveAccountError()):
+            with self.subTest(error=type(error).__name__):
+                self.service.login_error = error
+                response = self._login()
+
+                self.assertGreaterEqual(response.status_code, 400)
+                self.assertEqual(response.headers.get_list("set-cookie"), [])
+
+    def test_failed_login_creates_no_tokens(self):
+        """Failed authentication never generates tokens."""
+        with (
+            mock.patch("app.modules.auth.router.create_access_token") as create_access,
+            mock.patch("app.modules.auth.router.create_refresh_token") as create_refresh,
+        ):
+            self.service.login_error = InvalidCredentialsError()
+            response = self._login()
+
+            self.assertEqual(response.status_code, 401)
+            create_access.assert_not_called()
+            create_refresh.assert_not_called()
+
+    def test_response_json_contains_no_access_token(self):
+        """The JSON body never contains the access token."""
+        response = self._login()
+
+        self.assertNotIn("access_token", response.json())
+
+    def test_response_json_contains_no_refresh_token(self):
+        """The JSON body never contains the refresh token."""
+        response = self._login()
+
+        self.assertNotIn("refresh_token", response.json())
+
+    def test_response_json_contains_no_password(self):
+        """The JSON body never contains the plaintext password."""
+        response = self._login()
+
+        self.assertNotIn("password", response.json())
+
+    def test_response_json_contains_no_password_hash(self):
+        """The JSON body never contains the password hash."""
+        response = self._login()
+
+        self.assertNotIn("password_hash", response.json())
+
+    def test_login_delegates_request_to_service(self):
+        """The router forwards the parsed login payload to the service."""
+        self._login()
+
+        self.assertEqual(len(self.service.login_calls), 1)
+        forwarded = self.service.login_calls[0]
+        self.assertEqual(str(forwarded.email), _LOGIN_PAYLOAD["email"])
+        self.assertEqual(forwarded.password, _LOGIN_PAYLOAD["password"])
+
+    def test_access_token_cookie_is_a_valid_access_token(self):
+        """The access cookie holds a signed access JWT for the logged-in user."""
+        value, _ = _cookie_map(self._login())[ACCESS_TOKEN_COOKIE]
+
+        claims = validate_access_token(value)
+
+        self.assertEqual(claims.user_id, self.service.last_response.id)
+        self.assertIs(claims.token_type, TokenType.ACCESS)
+
+    def test_refresh_token_cookie_is_a_valid_refresh_token(self):
+        """The refresh cookie holds a signed refresh JWT for the logged-in user."""
+        value, _ = _cookie_map(self._login())[REFRESH_TOKEN_COOKIE]
+
+        claims = validate_refresh_token(value)
+
+        self.assertEqual(claims.user_id, self.service.last_response.id)
+        self.assertIs(claims.token_type, TokenType.REFRESH)
+
+    def test_unexpected_service_error_is_not_an_auth_error(self):
+        """Unexpected errors surface as 500, never as 401/403/423."""
+        self.service.login_error = RuntimeError("boom")
+
+        response = self._login()
+
+        self.assertEqual(response.status_code, 500)
+        self.assertNotIn(response.status_code, (401, 403, 423))
+
+
 class RouterRegistrationTests(unittest.TestCase):
     """Mounting and dependency wiring (no HTTP client required)."""
 
@@ -180,6 +447,16 @@ class RouterRegistrationTests(unittest.TestCase):
     def test_registration_route_only_accepts_post(self):
         """The register route exposes only the POST method."""
         path_spec = app.openapi()["paths"][REGISTER_PATH]
+        self.assertEqual(set(path_spec), {"post"})
+
+    def test_login_route_is_mounted_with_api_prefix(self):
+        """The login route is reachable at the composed /api/v1 path."""
+        paths = app.openapi()["paths"]
+        self.assertIn(LOGIN_PATH, paths)
+
+    def test_login_route_only_accepts_post(self):
+        """The login route exposes only the POST method."""
+        path_spec = app.openapi()["paths"][LOGIN_PATH]
         self.assertEqual(set(path_spec), {"post"})
 
     def test_get_auth_service_wires_session_into_repository(self):
