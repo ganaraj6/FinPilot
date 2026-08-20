@@ -56,6 +56,7 @@ _HAS_HTTP_CLIENT = (
 
 REGISTER_PATH = "/api/v1/auth/register"
 LOGIN_PATH = "/api/v1/auth/login"
+LOGOUT_PATH = "/api/v1/auth/logout"
 
 _PAYLOAD = {
     "full_name": "Test User",
@@ -814,6 +815,145 @@ class RefreshEndpointTests(unittest.TestCase):
         self.assertIsNone(getattr(user, "last_login_at", None))
         self.assertEqual(getattr(user, "failed_login_attempts", 0), 0)
         self.assertIsNone(getattr(user, "locked_until", None))
+
+
+@unittest.skipUnless(_HAS_HTTP_CLIENT, "httpx2 (or httpx) is required for TestClient")
+class LogoutEndpointTests(unittest.TestCase):
+    """POST /api/v1/auth/logout HTTP behaviour."""
+
+    def setUp(self) -> None:
+        """Create a test client with no service dependency required."""
+        self.client = TestClient(app, raise_server_exceptions=False)
+        self.settings = get_settings()
+
+    def test_logout_returns_204(self):
+        """Logout returns 204 No Content."""
+        response = self.client.post(LOGOUT_PATH)
+
+        self.assertEqual(response.status_code, 204)
+
+    def test_logout_works_with_no_cookies(self):
+        """Logout succeeds when no cookies are present."""
+        response = self.client.post(LOGOUT_PATH)
+
+        self.assertEqual(response.status_code, 204)
+
+    def test_logout_works_with_malformed_cookies(self):
+        """Logout succeeds when cookies contain malformed values."""
+        cookies = {
+            ACCESS_TOKEN_COOKIE: "not-a-jwt",
+            REFRESH_TOKEN_COOKIE: "also-not-a-jwt",
+        }
+        response = self.client.post(LOGOUT_PATH, cookies=cookies)
+
+        self.assertEqual(response.status_code, 204)
+
+    def test_logout_works_with_expired_cookies(self):
+        """Logout succeeds when cookies contain expired-looking tokens."""
+        cookies = {
+            ACCESS_TOKEN_COOKIE: "expired.token.value",
+            REFRESH_TOKEN_COOKIE: "expired.token.value",
+        }
+        response = self.client.post(LOGOUT_PATH, cookies=cookies)
+
+        self.assertEqual(response.status_code, 204)
+
+    def test_logout_does_not_require_auth_service(self):
+        """Logout does not depend on or call AuthService."""
+        mock_service = mock.MagicMock()
+        app.dependency_overrides[get_auth_service] = lambda: mock_service
+
+        response = self.client.post(LOGOUT_PATH)
+
+        self.assertEqual(response.status_code, 204)
+        mock_service.login.assert_not_called()
+        mock_service.register.assert_not_called()
+        if hasattr(mock_service, "get_user_for_refresh"):
+            mock_service.get_user_for_refresh.assert_not_called()
+
+        app.dependency_overrides.pop(get_auth_service, None)
+
+    def test_logout_clears_access_token_cookie(self):
+        """Logout clears the access_token cookie."""
+        response = self.client.post(LOGOUT_PATH)
+
+        cookies = _cookie_map(response)
+        self.assertIn(ACCESS_TOKEN_COOKIE, cookies)
+        value, _ = cookies[ACCESS_TOKEN_COOKIE]
+        self.assertIn(value, ("", '""'))
+
+    def test_logout_clears_refresh_token_cookie(self):
+        """Logout clears the refresh_token cookie."""
+        response = self.client.post(LOGOUT_PATH)
+
+        cookies = _cookie_map(response)
+        self.assertIn(REFRESH_TOKEN_COOKIE, cookies)
+        value, _ = cookies[REFRESH_TOKEN_COOKIE]
+        self.assertIn(value, ("", '""'))
+
+    def test_logout_access_cookie_uses_correct_path(self):
+        """The cleared access_token cookie uses path /api/v1."""
+        response = self.client.post(LOGOUT_PATH)
+
+        _, attributes = _cookie_map(response)[ACCESS_TOKEN_COOKIE]
+        self.assertEqual(attributes.get("path"), "/api/v1")
+
+    def test_logout_refresh_cookie_uses_correct_path(self):
+        """The cleared refresh_token cookie uses path /api/v1/auth."""
+        response = self.client.post(LOGOUT_PATH)
+
+        _, attributes = _cookie_map(response)[REFRESH_TOKEN_COOKIE]
+        self.assertEqual(attributes.get("path"), "/api/v1/auth")
+
+    def test_logout_response_has_no_json_body(self):
+        """Logout returns no JSON body."""
+        response = self.client.post(LOGOUT_PATH)
+
+        self.assertEqual(response.status_code, 204)
+        self.assertEqual(response.text, "")
+
+    def test_logout_does_not_return_access_token(self):
+        """Logout never includes access_token in the response."""
+        response = self.client.post(LOGOUT_PATH)
+
+        self.assertNotIn("access_token", response.text)
+
+    def test_logout_does_not_return_refresh_token(self):
+        """Logout never includes refresh_token in the response."""
+        response = self.client.post(LOGOUT_PATH)
+
+        self.assertNotIn("refresh_token", response.text)
+
+    def test_logout_clears_existing_cookies(self):
+        """Logout clears cookies even when valid cookies were previously set."""
+        from app.core.tokens import create_access_token, create_refresh_token
+
+        fake_user_id = uuid.uuid4()
+        access_token = create_access_token(fake_user_id)
+        refresh_token = create_refresh_token(fake_user_id)
+        cookies = {
+            ACCESS_TOKEN_COOKIE: access_token,
+            REFRESH_TOKEN_COOKIE: refresh_token,
+        }
+
+        logout_response = self.client.post(LOGOUT_PATH, cookies=cookies)
+        self.assertEqual(logout_response.status_code, 204)
+
+        cleared = _cookie_map(logout_response)
+        _, access_attrs = cleared[ACCESS_TOKEN_COOKIE]
+        _, refresh_attrs = cleared[REFRESH_TOKEN_COOKIE]
+        self.assertEqual(access_attrs.get("max-age"), "0")
+        self.assertEqual(refresh_attrs.get("max-age"), "0")
+
+    def test_logout_route_is_mounted_with_api_prefix(self):
+        """The logout route is reachable at the composed /api/v1 path."""
+        paths = app.openapi()["paths"]
+        self.assertIn(LOGOUT_PATH, paths)
+
+    def test_logout_route_only_accepts_post(self):
+        """The logout route exposes only the POST method."""
+        path_spec = app.openapi()["paths"][LOGOUT_PATH]
+        self.assertEqual(set(path_spec), {"post"})
 
 
 if __name__ == "__main__":

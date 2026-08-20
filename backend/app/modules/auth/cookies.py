@@ -114,6 +114,32 @@ def set_auth_cookies(
     )
 
 
+def clear_auth_cookies(response: Response, *, settings: Settings) -> None:
+    """Clear the access and refresh token cookies.
+
+    Both cookies are deleted using the same path, HttpOnly, SameSite, and
+    Secure attributes they were created with so the browser removes them.
+
+    Args:
+        response: The response the Set-Cookie deletion headers are attached to.
+        settings: Application settings providing cookie attributes.
+    """
+    response.delete_cookie(
+        key=ACCESS_TOKEN_COOKIE,
+        path=access_token_cookie_path(settings),
+        secure=_secure_cookie(settings),
+        httponly=True,
+        samesite=_SAMESITE,
+    )
+    response.delete_cookie(
+        key=REFRESH_TOKEN_COOKIE,
+        path=refresh_token_cookie_path(settings),
+        secure=_secure_cookie(settings),
+        httponly=True,
+        samesite=_SAMESITE,
+    )
+
+
 def set_access_token_cookie(
     response: Response,
     *,

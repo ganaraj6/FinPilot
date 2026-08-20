@@ -28,6 +28,7 @@ from app.core.tokens import (
 from app.database.session import get_db
 from app.modules.auth.cookies import (
     REFRESH_TOKEN_COOKIE,
+    clear_auth_cookies,
     set_access_token_cookie,
     set_auth_cookies,
 )
@@ -214,3 +215,27 @@ def refresh(
         settings=settings,
     )
     return AuthenticatedUserResponse.model_validate(user)
+
+
+@router.post(
+    "/logout",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Log out",
+)
+def logout(response: Response) -> Response:
+    """Clear the authentication cookies.
+
+    Logout is a browser-side credential cleanup. It does not require a
+    valid access token or refresh token, does not validate JWTs, and
+    performs no database work.
+
+    Args:
+        response: The response the cookie-clearing headers are attached to.
+
+    Returns:
+        The response with 204 No Content and cleared authentication cookies.
+    """
+    settings = get_settings()
+    clear_auth_cookies(response, settings=settings)
+    response.status_code = status.HTTP_204_NO_CONTENT
+    return response
