@@ -14,6 +14,7 @@ user row for the duration of the transaction.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from uuid import UUID
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -58,6 +59,26 @@ class AuthService(BaseService):
         """
         self._db = db
         self._repository = repository
+
+    def get_user_for_refresh(self, user_id: UUID) -> User:
+        """Load a user for token refresh, raising if missing or inactive.
+
+        The same generic error is raised for nonexistent and inactive users
+        so callers cannot distinguish the two cases.
+
+        Args:
+            user_id: The UUID extracted from the validated refresh token.
+
+        Returns:
+            The active user entity.
+
+        Raises:
+            InvalidCredentialsError: If the user does not exist or is inactive.
+        """
+        user = self._repository.get_by_id(user_id)
+        if user is None or not user.is_active:
+            raise InvalidCredentialsError()
+        return user
 
     def service_name(self) -> str:
         """Return the canonical service name for this module."""

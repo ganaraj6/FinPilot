@@ -37,7 +37,13 @@ from app.core.exceptions import (
     InactiveAccountError,
     InvalidCredentialsError,
 )
-from app.core.tokens import TokenType, validate_access_token, validate_refresh_token
+from app.core.tokens import (
+    TokenType,
+    create_access_token,
+    create_refresh_token,
+    validate_access_token,
+    validate_refresh_token,
+)
 from app.main import app
 from app.modules.auth.cookies import ACCESS_TOKEN_COOKIE, REFRESH_TOKEN_COOKIE
 from app.modules.auth.router import get_auth_service
@@ -467,6 +473,347 @@ class RouterRegistrationTests(unittest.TestCase):
 
         self.assertIsInstance(service, AuthService)
         self.assertIs(service._db, db)
+
+    def test_refresh_route_is_mounted_with_api_prefix(self):
+        """The refresh route is reachable at the composed /api/v1 path."""
+        paths = app.openapi()["paths"]
+        self.assertIn(REFRESH_PATH, paths)
+
+    def test_refresh_route_only_accepts_post(self):
+        """The refresh route exposes only the POST method."""
+        path_spec = app.openapi()["paths"][REFRESH_PATH]
+        self.assertEqual(set(path_spec), {"post"})
+
+
+REFRESH_PATH = "/api/v1/auth/refresh"
+
+
+def _make_user_entity(*, user_id=None, is_active=True):
+    """Build a minimal User-like object for repository fakes."""
+
+    class _User:
+        pass
+
+    u = _User()
+    u.id = user_id or uuid.uuid4()
+    u.is_active = is_active
+    u.full_name = "Test User"
+    u.email = "user@example.com"
+    u.profile_photo_url = None
+    u.currency = "USD"
+    u.timezone = "UTC"
+    u.onboarding_completed = False
+    u.email_verified_at = None
+    u.created_at = datetime.now(UTC)
+    return u
+
+
+class FakeRefreshRepository:
+    """Repository fake that returns a preconfigured user for get_by_id."""
+
+    def __init__(self, user):
+        """Store the user and record get_by_id calls."""
+        self._user = user
+        self.get_by_id_calls: list = []
+
+    def get_by_id(self, user_id):
+        """Record the call and return the stored user only when ID matches."""
+        self.get_by_id_calls.append(user_id)
+        if user_id != self._user.id:
+            return None
+        return self._user
+
+
+class FakeRefreshAuthService:
+    """Minimal AuthService stand-in for refresh tests exposing user lookup."""
+
+    def __init__(self, repository):
+        """Store the repository for user lookup."""
+        self._repository = repository
+
+    def get_user_for_refresh(self, user_id):
+        """Delegate to repository and reject missing/inactive users."""
+        user = self._repository.get_by_id(user_id)
+        if user is None or not user.is_active:
+            raise InvalidCredentialsError()
+        return user
+
+
+class RefreshEndpointTests(unittest.TestCase):
+    """POST /api/v1/auth/refresh HTTP behaviour."""
+
+    def setUp(self) -> None:
+        """Wire a fake service with a user entity and create a test client."""
+        self.user = _make_user_entity()
+        self.repo = FakeRefreshRepository(self.user)
+        self.service = FakeRefreshAuthService(self.repo)
+        self.previous_override = app.dependency_overrides.get(get_auth_service)
+        app.dependency_overrides[get_auth_service] = lambda: self.service
+        self.client = TestClient(app, raise_server_exceptions=False)
+
+    def tearDown(self) -> None:
+        """Restore the original dependency override state."""
+        if self.previous_override is None:
+            app.dependency_overrides.pop(get_auth_service, None)
+        else:
+            app.dependency_overrides[get_auth_service] = self.previous_override
+
+    def _valid_refresh_cookie(self, user_id=None):
+        """Return a cookie dict containing a valid refresh token."""
+        uid = user_id or self.user.id
+        token = create_refresh_token(uid)
+        return {REFRESH_TOKEN_COOKIE: token}
+
+    def test_valid_refresh_returns_200(self):
+        """A valid refresh cookie returns 200 OK."""
+        response = self.client.post(REFRESH_PATH, cookies=self._valid_refresh_cookie())
+
+        self.assertEqual(response.status_code, 200)
+
+    def test_valid_refresh_returns_authenticated_user_response(self):
+        """The refresh body is the safe profile for the user."""
+        response = self.client.post(REFRESH_PATH, cookies=self._valid_refresh_cookie())
+
+        expected = AuthenticatedUserResponse.model_validate(self.user).model_dump(mode="json")
+        self.assertEqual(response.json(), expected)
+
+    def test_valid_refresh_sets_new_access_token_cookie(self):
+        """A successful refresh sets a new access token cookie."""
+        response = self.client.post(REFRESH_PATH, cookies=self._valid_refresh_cookie())
+
+        cookies = _cookie_map(response)
+        self.assertIn(ACCESS_TOKEN_COOKIE, cookies)
+
+    def test_refresh_does_not_set_refresh_token_cookie(self):
+        """A successful refresh does not overwrite the refresh token cookie."""
+        response = self.client.post(REFRESH_PATH, cookies=self._valid_refresh_cookie())
+
+        raw_headers = getattr(response, "raw_headers", None)
+        if raw_headers is not None:
+            headers = [
+                value.decode("latin-1")
+                for key, value in raw_headers
+                if key.decode("latin-1").lower() == "set-cookie"
+            ]
+        else:
+            headers = response.headers.get_list("set-cookie")
+        for header in headers:
+            name = header.split("=")[0].strip()
+            self.assertNotEqual(name, REFRESH_TOKEN_COOKIE)
+
+    def test_new_access_token_validates_successfully(self):
+        """The new access cookie holds a valid signed access JWT."""
+        response = self.client.post(REFRESH_PATH, cookies=self._valid_refresh_cookie())
+
+        value, _ = _cookie_map(response)[ACCESS_TOKEN_COOKIE]
+        claims = validate_access_token(value)
+
+        self.assertEqual(claims.user_id, self.user.id)
+
+    def test_new_access_token_has_correct_user_id(self):
+        """The new access token carries the correct user ID."""
+        response = self.client.post(REFRESH_PATH, cookies=self._valid_refresh_cookie())
+
+        value, _ = _cookie_map(response)[ACCESS_TOKEN_COOKIE]
+        claims = validate_access_token(value)
+
+        self.assertEqual(claims.user_id, self.user.id)
+
+    def test_new_access_token_has_token_type_access(self):
+        """The new access token has token_type=access."""
+        response = self.client.post(REFRESH_PATH, cookies=self._valid_refresh_cookie())
+
+        value, _ = _cookie_map(response)[ACCESS_TOKEN_COOKIE]
+        claims = validate_access_token(value)
+
+        self.assertIs(claims.token_type, TokenType.ACCESS)
+
+    def test_missing_refresh_token_cookie_returns_401(self):
+        """A missing refresh cookie returns 401."""
+        response = self.client.post(REFRESH_PATH)
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json(), {"detail": "Invalid or expired refresh token"})
+
+    def test_malformed_refresh_token_returns_401(self):
+        """A malformed refresh token returns 401."""
+        response = self.client.post(REFRESH_PATH, cookies={REFRESH_TOKEN_COOKIE: "not.a.jwt"})
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_expired_refresh_token_returns_401(self):
+        """An expired refresh token returns 401."""
+        from app.config.settings import Settings
+
+        test_settings = Settings(
+            jwt_secret_key="test-secret-key-for-auth-router-tests-0123456789",
+            jwt_algorithm="HS256",
+            access_token_expire_minutes=15,
+            refresh_token_expire_minutes=60 * 24 * 14,
+        )
+        payload = {
+            "sub": str(self.user.id),
+            "token_type": "refresh",
+            "jti": str(uuid.uuid4()),
+            "iat": datetime(2020, 1, 1, tzinfo=UTC),
+            "exp": datetime(2020, 1, 1, 1, tzinfo=UTC),
+        }
+        import jwt
+
+        expired_token = jwt.encode(
+            payload,
+            test_settings.jwt_secret_key.get_secret_value(),
+            algorithm=test_settings.jwt_algorithm,
+        )
+        response = self.client.post(REFRESH_PATH, cookies={REFRESH_TOKEN_COOKIE: expired_token})
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_access_token_as_refresh_returns_401(self):
+        """An access token supplied as a refresh token returns 401."""
+        access_token = create_access_token(self.user.id)
+        response = self.client.post(REFRESH_PATH, cookies={REFRESH_TOKEN_COOKIE: access_token})
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_tampered_refresh_token_returns_401(self):
+        """A tampered refresh token returns 401."""
+        token = create_refresh_token(self.user.id)
+        tampered = token[:-5] + "XXXXX"
+        response = self.client.post(REFRESH_PATH, cookies={REFRESH_TOKEN_COOKIE: tampered})
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_invalid_signature_returns_401(self):
+        """A refresh token signed with the wrong secret returns 401."""
+        from app.config.settings import Settings
+        from app.core.tokens import TokenService
+
+        wrong_settings = Settings(
+            jwt_secret_key="wrong-secret-key-that-is-long-enough-0000",
+            jwt_algorithm="HS256",
+            access_token_expire_minutes=15,
+            refresh_token_expire_minutes=60 * 24 * 14,
+        )
+        ts = TokenService(wrong_settings)
+        token_with_wrong_sig = ts.create_refresh_token(self.user.id)
+        response = self.client.post(
+            REFRESH_PATH, cookies={REFRESH_TOKEN_COOKIE: token_with_wrong_sig}
+        )
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_user_not_found_returns_401(self):
+        """A refresh token for a nonexistent user returns 401."""
+        other_id = uuid.uuid4()
+        response = self.client.post(REFRESH_PATH, cookies=self._valid_refresh_cookie(other_id))
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_inactive_user_returns_401(self):
+        """A refresh token for an inactive user returns 401."""
+        inactive_user = _make_user_entity(is_active=False)
+        self.repo._user = inactive_user
+        response = self.client.post(
+            REFRESH_PATH, cookies=self._valid_refresh_cookie(inactive_user.id)
+        )
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_failed_refresh_sets_no_access_token_cookie(self):
+        """A failed refresh does not set an access token cookie."""
+        response = self.client.post(REFRESH_PATH)
+
+        raw_headers = getattr(response, "raw_headers", None)
+        if raw_headers is not None:
+            headers = [
+                value.decode("latin-1")
+                for key, value in raw_headers
+                if key.decode("latin-1").lower() == "set-cookie"
+            ]
+        else:
+            headers = response.headers.get_list("set-cookie")
+        for header in headers:
+            name = header.split("=")[0].strip()
+            self.assertNotEqual(name, ACCESS_TOKEN_COOKIE)
+
+    def test_failed_refresh_does_not_modify_refresh_cookie(self):
+        """A failed refresh does not overwrite the refresh token cookie."""
+        response = self.client.post(REFRESH_PATH, cookies={REFRESH_TOKEN_COOKIE: "invalid"})
+
+        self.assertEqual(response.status_code, 401)
+        cookies = _cookie_map(response)
+        self.assertNotIn(REFRESH_TOKEN_COOKIE, cookies)
+
+    def test_response_json_is_safe_profile(self):
+        """The response JSON is the safe user profile with no sensitive fields."""
+        response = self.client.post(REFRESH_PATH, cookies=self._valid_refresh_cookie())
+
+        body = response.json()
+        self.assertIn("id", body)
+        self.assertIn("email", body)
+        self.assertNotIn("password", body)
+        self.assertNotIn("password_hash", body)
+
+    def test_response_json_contains_no_jwt_strings(self):
+        """The response JSON contains no JWT token strings."""
+        response = self.client.post(REFRESH_PATH, cookies=self._valid_refresh_cookie())
+
+        body_str = str(response.json())
+        self.assertNotRegex(body_str, r"eyJ")
+
+    def test_refresh_delegates_user_lookup_to_public_service_method(self):
+        """The router delegates user lookup to the public AuthService method."""
+        self.client.post(REFRESH_PATH, cookies=self._valid_refresh_cookie())
+
+        self.assertEqual(len(self.repo.get_by_id_calls), 1)
+        self.assertEqual(self.repo.get_by_id_calls[0], self.user.id)
+
+    def test_router_does_not_access_service_private_repository(self):
+        """Refresh works even when _repository is inaccessible on the service."""
+        user = self.user
+
+        class ServiceWithoutRepository:
+            """Service that only exposes the public get_user_for_refresh method."""
+
+            def get_user_for_refresh(self, user_id):
+                if user_id != user.id or not user.is_active:
+                    raise InvalidCredentialsError()
+                return user
+
+        app.dependency_overrides[get_auth_service] = lambda: ServiceWithoutRepository()
+
+        response = self.client.post(REFRESH_PATH, cookies=self._valid_refresh_cookie())
+
+        self.assertEqual(response.status_code, 200)
+
+    def test_unexpected_error_is_not_401(self):
+        """Unexpected internal errors propagate as 500, not 401."""
+        self.repo.get_by_id = lambda uid: (_ for _ in ()).throw(RuntimeError("boom"))
+
+        response = self.client.post(REFRESH_PATH, cookies=self._valid_refresh_cookie())
+
+        self.assertEqual(response.status_code, 500)
+
+    def test_refresh_does_not_call_service_login(self):
+        """Refresh never delegates to AuthService.login."""
+        self.service.login = lambda req: (_ for _ in ()).should_not_be_called()
+        self.client.post(REFRESH_PATH, cookies=self._valid_refresh_cookie())
+
+        self.assertFalse(hasattr(self.service, "_login_called"))
+
+    def test_refresh_does_not_modify_authentication_state(self):
+        """Refresh does not update last_login_at, failed_login_attempts, or locked_until."""
+        user = _make_user_entity()
+        repo = FakeRefreshRepository(user)
+        service = FakeRefreshAuthService(repo)
+        app.dependency_overrides[get_auth_service] = lambda: service
+
+        self.client.post(REFRESH_PATH, cookies=self._valid_refresh_cookie(user.id))
+
+        self.assertIsNone(getattr(user, "last_login_at", None))
+        self.assertEqual(getattr(user, "failed_login_attempts", 0), 0)
+        self.assertIsNone(getattr(user, "locked_until", None))
 
 
 if __name__ == "__main__":

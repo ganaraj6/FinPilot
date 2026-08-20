@@ -7,19 +7,30 @@ No business logic (email normalization, password hashing, duplicate detection)
 lives here.
 """
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy.orm import Session
 
 from app.config.settings import get_settings
 from app.core.exceptions import (
     AccountLockedError,
     EmailAlreadyRegisteredError,
+    ExpiredTokenError,
     InactiveAccountError,
     InvalidCredentialsError,
+    InvalidTokenError,
+    InvalidTokenTypeError,
 )
-from app.core.tokens import create_access_token, create_refresh_token
+from app.core.tokens import (
+    create_access_token,
+    create_refresh_token,
+    validate_refresh_token,
+)
 from app.database.session import get_db
-from app.modules.auth.cookies import set_auth_cookies
+from app.modules.auth.cookies import (
+    REFRESH_TOKEN_COOKIE,
+    set_access_token_cookie,
+    set_auth_cookies,
+)
 from app.modules.auth.repository import UserRepository
 from app.modules.auth.schemas import (
     AuthenticatedUserResponse,
@@ -136,3 +147,70 @@ def login(
         settings=settings,
     )
     return user
+
+
+@router.post(
+    "/refresh",
+    response_model=AuthenticatedUserResponse,
+    status_code=status.HTTP_200_OK,
+    responses={
+        status.HTTP_401_UNAUTHORIZED: {"description": "Invalid or expired refresh token"},
+    },
+    summary="Refresh the access token",
+)
+def refresh(
+    request: Request,
+    response: Response,
+    service: AuthService = Depends(get_auth_service),
+) -> AuthenticatedUserResponse:
+    """Issue a new access token from a valid refresh token cookie.
+
+    The refresh token is read exclusively from the HttpOnly cookie. If the
+    token is valid and the user still exists and is active, a new access token
+    is set as an HttpOnly cookie and the safe user profile is returned. The
+    refresh-token cookie is never modified.
+
+    Args:
+        request: The incoming request carrying the refresh-token cookie.
+        response: The response the new access-token cookie is attached to.
+        service: AuthService providing user lookup for token refresh.
+
+    Returns:
+        The safe authenticated-user profile; the new access token travels
+        only in Set-Cookie.
+
+    Raises:
+        HTTPException: 401 for missing, invalid, expired, or wrong-type
+            refresh tokens, or for inactive or nonexistent users.
+    """
+    refresh_token_value = request.cookies.get(REFRESH_TOKEN_COOKIE)
+    if refresh_token_value is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired refresh token",
+        )
+
+    try:
+        claims = validate_refresh_token(refresh_token_value)
+    except (InvalidTokenError, ExpiredTokenError, InvalidTokenTypeError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired refresh token",
+        ) from exc
+
+    try:
+        user = service.get_user_for_refresh(claims.user_id)
+    except InvalidCredentialsError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired refresh token",
+        ) from exc
+
+    settings = get_settings()
+    new_access_token = create_access_token(user.id)
+    set_access_token_cookie(
+        response,
+        access_token=new_access_token,
+        settings=settings,
+    )
+    return AuthenticatedUserResponse.model_validate(user)

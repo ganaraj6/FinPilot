@@ -112,3 +112,31 @@ def set_auth_cookies(
         httponly=True,
         samesite=_SAMESITE,
     )
+
+
+def set_access_token_cookie(
+    response: Response,
+    *,
+    access_token: str,
+    settings: Settings,
+) -> None:
+    """Attach only the access token to a response as an HttpOnly cookie.
+
+    Used by the refresh endpoint which replaces the access token while leaving
+    the refresh-token cookie untouched.
+
+    Args:
+        response: The response the Set-Cookie header is attached to.
+        access_token: Signed JWT access token to store.
+        settings: Application settings providing cookie attributes and the
+            access-token lifetime.
+    """
+    response.set_cookie(
+        key=ACCESS_TOKEN_COOKIE,
+        value=access_token,
+        max_age=settings.access_token_expire_minutes * 60,
+        path=access_token_cookie_path(settings),
+        secure=_secure_cookie(settings),
+        httponly=True,
+        samesite=_SAMESITE,
+    )
