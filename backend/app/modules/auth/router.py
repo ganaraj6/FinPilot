@@ -8,7 +8,6 @@ lives here.
 """
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
-from sqlalchemy.orm import Session
 
 from app.config.settings import get_settings
 from app.core.exceptions import (
@@ -25,14 +24,14 @@ from app.core.tokens import (
     create_refresh_token,
     validate_refresh_token,
 )
-from app.database.session import get_db
 from app.modules.auth.cookies import (
     REFRESH_TOKEN_COOKIE,
     clear_auth_cookies,
     set_access_token_cookie,
     set_auth_cookies,
 )
-from app.modules.auth.repository import UserRepository
+from app.modules.auth.dependencies import get_auth_service, get_current_user
+from app.modules.auth.models import User
 from app.modules.auth.schemas import (
     AuthenticatedUserResponse,
     UserLoginRequest,
@@ -41,18 +40,6 @@ from app.modules.auth.schemas import (
 from app.modules.auth.service import AuthService
 
 router = APIRouter(prefix="/auth", tags=["auth"])
-
-
-def get_auth_service(db: Session = Depends(get_db)) -> AuthService:
-    """Build the auth service for the current request.
-
-    Args:
-        db: The request-scoped database session provided by get_db.
-
-    Returns:
-        An AuthService bound to the session and its user repository.
-    """
-    return AuthService(db, UserRepository(db))
 
 
 @router.post(
@@ -239,3 +226,27 @@ def logout(response: Response) -> Response:
     clear_auth_cookies(response, settings=settings)
     response.status_code = status.HTTP_204_NO_CONTENT
     return response
+
+
+@router.get(
+    "/me",
+    response_model=AuthenticatedUserResponse,
+    status_code=status.HTTP_200_OK,
+    responses={
+        status.HTTP_401_UNAUTHORIZED: {"description": "Authentication required"},
+    },
+    summary="Get the authenticated user profile",
+)
+def me(user: User = Depends(get_current_user)) -> AuthenticatedUserResponse:
+    """Return the safe profile of the authenticated user.
+
+    The access token is read from the HttpOnly cookie by the
+    ``get_current_user`` dependency. No business logic lives here.
+
+    Args:
+        user: The active User entity resolved by ``get_current_user``.
+
+    Returns:
+        The safe authenticated-user profile.
+    """
+    return AuthenticatedUserResponse.model_validate(user)

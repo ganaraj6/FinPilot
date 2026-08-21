@@ -46,6 +46,7 @@ from app.core.tokens import (
 )
 from app.main import app
 from app.modules.auth.cookies import ACCESS_TOKEN_COOKIE, REFRESH_TOKEN_COOKIE
+from app.modules.auth.dependencies import get_current_user
 from app.modules.auth.router import get_auth_service
 from app.modules.auth.schemas import AuthenticatedUserResponse
 from app.modules.auth.service import AuthService
@@ -954,6 +955,301 @@ class LogoutEndpointTests(unittest.TestCase):
         """The logout route exposes only the POST method."""
         path_spec = app.openapi()["paths"][LOGOUT_PATH]
         self.assertEqual(set(path_spec), {"post"})
+
+
+ME_PATH = "/api/v1/auth/me"
+
+
+class FakeAccessRepository:
+    """Repository fake for access-token dependency tests."""
+
+    def __init__(self, user):
+        """Store the user and record get_by_id calls."""
+        self._user = user
+        self.get_by_id_calls: list = []
+
+    def get_by_id(self, user_id):
+        """Record the call and return the stored user only when ID matches."""
+        self.get_by_id_calls.append(user_id)
+        if user_id != self._user.id:
+            return None
+        return self._user
+
+
+class FakeAccessAuthService:
+    """Minimal AuthService stand-in for access-token tests."""
+
+    def __init__(self, repository):
+        """Store the repository for user lookup."""
+        self._repository = repository
+
+    def get_user_for_access(self, user_id):
+        """Delegate to repository and reject missing/inactive users."""
+        user = self._repository.get_by_id(user_id)
+        if user is None or not user.is_active:
+            raise InvalidCredentialsError()
+        return user
+
+
+class GetMeEndpointTests(unittest.TestCase):
+    """GET /api/v1/auth/me HTTP behaviour."""
+
+    def setUp(self) -> None:
+        """Wire a fake service with a user entity and create a test client."""
+        self.user = _make_user_entity()
+        self.repo = FakeAccessRepository(self.user)
+        self.service = FakeAccessAuthService(self.repo)
+        self.previous_override = app.dependency_overrides.get(get_auth_service)
+        app.dependency_overrides[get_auth_service] = lambda: self.service
+        self.client = TestClient(app, raise_server_exceptions=False)
+
+    def tearDown(self) -> None:
+        """Restore the original dependency override state."""
+        if self.previous_override is None:
+            app.dependency_overrides.pop(get_auth_service, None)
+        else:
+            app.dependency_overrides[get_auth_service] = self.previous_override
+
+    def _valid_access_cookie(self, user_id=None):
+        """Return a cookie dict containing a valid access token."""
+        uid = user_id or self.user.id
+        token = create_access_token(uid)
+        return {ACCESS_TOKEN_COOKIE: token}
+
+    def test_valid_access_returns_200(self):
+        """A valid access cookie returns 200 OK."""
+        response = self.client.get(ME_PATH, cookies=self._valid_access_cookie())
+
+        self.assertEqual(response.status_code, 200)
+
+    def test_valid_access_returns_authenticated_user_response(self):
+        """The me body is the safe profile for the user."""
+        response = self.client.get(ME_PATH, cookies=self._valid_access_cookie())
+
+        expected = AuthenticatedUserResponse.model_validate(self.user).model_dump(mode="json")
+        self.assertEqual(response.json(), expected)
+
+    def test_valid_access_returns_correct_user_id(self):
+        """The response contains the authenticated user's ID."""
+        response = self.client.get(ME_PATH, cookies=self._valid_access_cookie())
+
+        self.assertEqual(response.json()["id"], str(self.user.id))
+
+    def test_valid_access_returns_correct_email(self):
+        """The response contains the authenticated user's email."""
+        response = self.client.get(ME_PATH, cookies=self._valid_access_cookie())
+
+        self.assertEqual(response.json()["email"], self.user.email)
+
+    def test_valid_access_returns_correct_full_name(self):
+        """The response contains the authenticated user's full name."""
+        response = self.client.get(ME_PATH, cookies=self._valid_access_cookie())
+
+        self.assertEqual(response.json()["full_name"], self.user.full_name)
+
+    def test_missing_access_token_cookie_returns_401(self):
+        """A missing access cookie returns 401."""
+        response = self.client.get(ME_PATH)
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json(), {"detail": "Authentication required"})
+
+    def test_malformed_access_token_returns_401(self):
+        """A malformed access token returns 401."""
+        response = self.client.get(ME_PATH, cookies={ACCESS_TOKEN_COOKIE: "not.a.jwt"})
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_expired_access_token_returns_401(self):
+        """An expired access token returns 401."""
+        from app.config.settings import Settings
+
+        test_settings = Settings(
+            jwt_secret_key="test-secret-key-for-auth-router-tests-0123456789",
+            jwt_algorithm="HS256",
+            access_token_expire_minutes=15,
+            refresh_token_expire_minutes=60 * 24 * 14,
+        )
+        payload = {
+            "sub": str(self.user.id),
+            "token_type": "access",
+            "jti": str(uuid.uuid4()),
+            "iat": datetime(2020, 1, 1, tzinfo=UTC),
+            "exp": datetime(2020, 1, 1, 1, tzinfo=UTC),
+        }
+        import jwt
+
+        expired_token = jwt.encode(
+            payload,
+            test_settings.jwt_secret_key.get_secret_value(),
+            algorithm=test_settings.jwt_algorithm,
+        )
+        response = self.client.get(ME_PATH, cookies={ACCESS_TOKEN_COOKIE: expired_token})
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_refresh_token_as_access_returns_401(self):
+        """A refresh token supplied as an access token returns 401."""
+        refresh_token = create_refresh_token(self.user.id)
+        response = self.client.get(ME_PATH, cookies={ACCESS_TOKEN_COOKIE: refresh_token})
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_tampered_access_token_returns_401(self):
+        """A tampered access token returns 401."""
+        token = create_access_token(self.user.id)
+        tampered = token[:-5] + "XXXXX"
+        response = self.client.get(ME_PATH, cookies={ACCESS_TOKEN_COOKIE: tampered})
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_invalid_signature_returns_401(self):
+        """An access token signed with the wrong secret returns 401."""
+        from app.config.settings import Settings
+        from app.core.tokens import TokenService
+
+        wrong_settings = Settings(
+            jwt_secret_key="wrong-secret-key-that-is-long-enough-0000",
+            jwt_algorithm="HS256",
+            access_token_expire_minutes=15,
+            refresh_token_expire_minutes=60 * 24 * 14,
+        )
+        ts = TokenService(wrong_settings)
+        token_with_wrong_sig = ts.create_access_token(self.user.id)
+        response = self.client.get(ME_PATH, cookies={ACCESS_TOKEN_COOKIE: token_with_wrong_sig})
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_user_not_found_returns_401(self):
+        """An access token for a nonexistent user returns 401."""
+        other_id = uuid.uuid4()
+        response = self.client.get(ME_PATH, cookies=self._valid_access_cookie(other_id))
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_inactive_user_returns_401(self):
+        """An access token for an inactive user returns 401."""
+        inactive_user = _make_user_entity(is_active=False)
+        self.repo._user = inactive_user
+        response = self.client.get(ME_PATH, cookies=self._valid_access_cookie(inactive_user.id))
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_me_sets_no_cookies(self):
+        """A successful me response does not set any cookies."""
+        response = self.client.get(ME_PATH, cookies=self._valid_access_cookie())
+
+        raw_headers = getattr(response, "raw_headers", None)
+        if raw_headers is not None:
+            headers = [
+                value.decode("latin-1")
+                for key, value in raw_headers
+                if key.decode("latin-1").lower() == "set-cookie"
+            ]
+        else:
+            headers = response.headers.get_list("set-cookie")
+        self.assertEqual(headers, [])
+
+    def test_response_json_is_safe_profile(self):
+        """The response JSON is the safe user profile with no sensitive fields."""
+        response = self.client.get(ME_PATH, cookies=self._valid_access_cookie())
+
+        body = response.json()
+        self.assertIn("id", body)
+        self.assertIn("email", body)
+        self.assertNotIn("password", body)
+        self.assertNotIn("password_hash", body)
+
+    def test_response_json_contains_no_jwt_strings(self):
+        """The response JSON contains no JWT token strings."""
+        response = self.client.get(ME_PATH, cookies=self._valid_access_cookie())
+
+        body_str = str(response.json())
+        self.assertNotRegex(body_str, r"eyJ")
+
+    def test_me_delegates_user_lookup_to_public_service_method(self):
+        """The dependency delegates user lookup to the public AuthService method."""
+        self.client.get(ME_PATH, cookies=self._valid_access_cookie())
+
+        self.assertEqual(len(self.repo.get_by_id_calls), 1)
+        self.assertEqual(self.repo.get_by_id_calls[0], self.user.id)
+
+    def test_router_does_not_access_service_private_repository(self):
+        """Me works even when _repository is inaccessible on the service."""
+        user = self.user
+
+        class ServiceWithoutRepository:
+            """Service that only exposes the public get_user_for_access method."""
+
+            def get_user_for_access(self, user_id):
+                if user_id != user.id or not user.is_active:
+                    raise InvalidCredentialsError()
+                return user
+
+        app.dependency_overrides[get_auth_service] = lambda: ServiceWithoutRepository()
+
+        response = self.client.get(ME_PATH, cookies=self._valid_access_cookie(user.id))
+
+        self.assertEqual(response.status_code, 200)
+
+    def test_unexpected_error_is_not_401(self):
+        """Unexpected internal errors propagate as 500, not 401."""
+        self.repo.get_by_id = lambda uid: (_ for _ in ()).throw(RuntimeError("boom"))
+
+        response = self.client.get(ME_PATH, cookies=self._valid_access_cookie())
+
+        self.assertEqual(response.status_code, 500)
+
+    def test_me_route_is_mounted_with_api_prefix(self):
+        """The me route is reachable at the composed /api/v1 path."""
+        paths = app.openapi()["paths"]
+        self.assertIn(ME_PATH, paths)
+
+    def test_me_route_only_accepts_get(self):
+        """The me route exposes only the GET method."""
+        path_spec = app.openapi()["paths"][ME_PATH]
+        self.assertEqual(set(path_spec), {"get"})
+
+    def test_locked_user_can_access_me(self):
+        """A locked but active user can still access /me via a valid access token."""
+        locked_user = _make_user_entity()
+        locked_user.locked_until = datetime(2099, 1, 1, tzinfo=UTC)
+        self.repo._user = locked_user
+        response = self.client.get(ME_PATH, cookies=self._valid_access_cookie(locked_user.id))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["id"], str(locked_user.id))
+
+    def test_get_current_user_lives_in_dependencies_module(self):
+        """get_current_user is defined in the dependencies module, not the router."""
+        import inspect
+
+        from app.modules.auth import dependencies as deps_mod
+
+        self.assertIs(
+            inspect.getmodule(get_current_user),
+            deps_mod,
+        )
+
+    def test_router_imports_get_current_user_from_dependencies(self):
+        """router.py obtains get_current_user from dependencies, not locally."""
+        import inspect
+
+        from app.modules.auth import router as router_mod
+
+        source = inspect.getsource(router_mod)
+        self.assertNotIn("async def get_current_user", source)
+
+    def test_get_auth_service_lives_in_dependencies_module(self):
+        """get_auth_service is defined in the dependencies module."""
+        import inspect
+
+        from app.modules.auth import dependencies as deps_mod
+
+        self.assertIs(
+            inspect.getmodule(get_auth_service),
+            deps_mod,
+        )
 
 
 if __name__ == "__main__":
