@@ -51,3 +51,28 @@ class ExpiredTokenError(TokenError):
 
 class InvalidTokenTypeError(TokenError):
     """Raised when a token's type does not match the expected token type."""
+
+
+class PasswordResetError(AuthenticationError):
+    """Base class for password reset and account recovery domain errors."""
+
+
+class InvalidPasswordResetTokenError(PasswordResetError):
+    """Raised when a submitted password-reset token matches no stored digest.
+
+    Also raised when the stored record no longer resolves to a usable account,
+    so callers cannot distinguish an unknown token from a deleted or
+    deactivated user.
+    """
+
+
+class ExpiredPasswordResetTokenError(PasswordResetError):
+    """Raised when a password-reset token is past its expiry timestamp."""
+
+
+class UsedPasswordResetTokenError(PasswordResetError):
+    """Raised when a password-reset token has already been consumed.
+
+    The same error covers a token that was spent by a completed reset and one
+    that was invalidated because a newer token was issued for the same user.
+    """

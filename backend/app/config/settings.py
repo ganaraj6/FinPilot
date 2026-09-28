@@ -32,6 +32,11 @@ class Settings(BaseSettings):
     access_token_expire_minutes: int = 15
     refresh_token_expire_minutes: int = 60 * 24 * 14
 
+    # Password reset configuration. The reset token is an opaque random string
+    # (not a JWT), so this lifetime is enforced against the expires_at column of
+    # the stored password-reset-token record rather than by a JWT claim.
+    password_reset_token_expire_minutes: int = 30
+
     @field_validator("jwt_secret_key")
     @classmethod
     def _validate_jwt_secret_key(cls, value: SecretStr) -> SecretStr:
@@ -62,6 +67,14 @@ class Settings(BaseSettings):
         """Require a positive refresh-token lifetime."""
         if value <= 0:
             raise ValueError("refresh_token_expire_minutes must be greater than 0")
+        return value
+
+    @field_validator("password_reset_token_expire_minutes")
+    @classmethod
+    def _validate_password_reset_token_expire_minutes(cls, value: int) -> int:
+        """Require a positive password-reset-token lifetime."""
+        if value <= 0:
+            raise ValueError("password_reset_token_expire_minutes must be greater than 0")
         return value
 
     @model_validator(mode="after")

@@ -1,14 +1,17 @@
 """Authentication business logic for the auth module.
 
-AuthService implements user registration and credential authentication. It
-depends only on the user repository, the password security utilities, and the
-database session. It raises application exceptions (app.core.exceptions) that
-the eventual router translates into HTTP responses; it never touches FastAPI,
+AuthService implements user registration, credential authentication, and the
+password-reset foundation. It depends only on its repositories, the password
+security utilities, the password-reset token utilities, and the database
+session. It raises application exceptions (app.core.exceptions) that the
+eventual router translates into HTTP responses; it never touches FastAPI,
 JWT, or cookies.
 
 Concurrent duplicate registrations are reconciled with the database unique
 constraint, and login serializes authentication-state updates by locking the
-user row for the duration of the transaction.
+user row for the duration of the transaction. Password reset locks both the
+reset-token row and the user row, and commits the password update, the token
+consumption, and the clearing of lockout state as one atomic unit.
 """
 
 from __future__ import annotations
@@ -19,15 +22,20 @@ from uuid import UUID
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.config.settings import Settings, get_settings
 from app.core.exceptions import (
     AccountLockedError,
     EmailAlreadyRegisteredError,
+    ExpiredPasswordResetTokenError,
     InactiveAccountError,
     InvalidCredentialsError,
+    InvalidPasswordResetTokenError,
+    UsedPasswordResetTokenError,
 )
+from app.core.reset_tokens import generate_password_reset_token, hash_password_reset_token
 from app.core.security import hash_password, verify_password
-from app.modules.auth.models import User
-from app.modules.auth.repository import UserRepository
+from app.modules.auth.models import PasswordResetToken, User
+from app.modules.auth.repository import PasswordResetTokenRepository, UserRepository
 from app.modules.auth.schemas import (
     AuthenticatedUserResponse,
     UserLoginRequest,
@@ -48,17 +56,34 @@ EMAIL_UNIQUE_CONSTRAINT_NAME = "uq_users_email"
 class AuthService(BaseService):
     """Registration and credential authentication business logic."""
 
-    def __init__(self, db: Session, repository: UserRepository) -> None:
-        """Initialize the service with a session and the user repository.
+    def __init__(
+        self,
+        db: Session,
+        repository: UserRepository,
+        reset_token_repository: PasswordResetTokenRepository | None = None,
+        settings: Settings | None = None,
+    ) -> None:
+        """Initialize the service with a session and its collaborators.
 
         Args:
-            db: Database session. The repository performs the writes; the
+            db: Database session. The repositories perform the writes; the
                 service owns the transaction boundary (commit) for each
                 logical operation.
             repository: Repository for all User persistence.
+            reset_token_repository: Repository for password-reset token
+                persistence. Defaults to a repository bound to the same session
+                so existing two-argument construction keeps working.
+            settings: Application settings supplying the reset-token lifetime.
+                Defaults to the cached application settings.
         """
         self._db = db
         self._repository = repository
+        self._reset_token_repository = (
+            reset_token_repository
+            if reset_token_repository is not None
+            else PasswordResetTokenRepository(db)
+        )
+        self._settings = settings if settings is not None else get_settings()
 
     def get_user_for_access(self, user_id: UUID) -> User:
         """Load a user for access-token validation, raising if missing or inactive.
@@ -218,6 +243,157 @@ class AuthService(BaseService):
                 user,
                 failed_login_attempts=failed_login_attempts,
             )
+
+    def create_password_reset_token(self, email: str) -> str | None:
+        """Issue a new password-reset token for the user with the given email.
+
+        Every previously issued but still-unused token for the same user is spent
+        in the same transaction, so only the most recently requested reset link
+        can ever be redeemed. Only the token's SHA-256 digest is persisted; the
+        raw token is returned to the caller, which owns delivering it to the
+        user through the future email layer.
+
+        Args:
+            email: The email address to issue a token for. It is normalized
+                through the same path as registration and login.
+
+        Returns:
+            The raw reset token to deliver, or None when no account has that
+            email. Returning None rather than raising lets the future HTTP layer
+            answer existing and unknown addresses identically, which prevents
+            account enumeration.
+        """
+        user = self._repository.get_by_email(self._normalize_email(email))
+        if user is None:
+            return None
+
+        raw_token = generate_password_reset_token()
+        now = self._utcnow()
+        try:
+            self._reset_token_repository.invalidate_unused_for_user(user.id, now)
+            self._reset_token_repository.create(
+                PasswordResetToken(
+                    user_id=user.id,
+                    token_hash=hash_password_reset_token(raw_token),
+                    expires_at=now
+                    + timedelta(minutes=self._settings.password_reset_token_expire_minutes),
+                )
+            )
+            self._db.commit()
+        except Exception:
+            self._db.rollback()
+            raise
+        return raw_token
+
+    def validate_password_reset_token(
+        self, token: str, *, for_update: bool = False
+    ) -> PasswordResetToken:
+        """Return the stored reset token for a submitted token if it is usable.
+
+        The submitted token is hashed and looked up by digest, so the raw token
+        is never compared against or recovered from storage. Expiry and
+        consumption state are evaluated here rather than in the repository,
+        which stays limited to persistence.
+
+        The three failure modes raise distinct domain errors so callers can tell
+        them apart internally. A future HTTP layer may deliberately collapse
+        them into one indistinguishable response.
+
+        Args:
+            token: The raw reset token as delivered to the user.
+            for_update: Whether to lock the token row (SELECT ... FOR UPDATE)
+                for the remainder of the current transaction, so concurrent
+                redemptions of the same token serialize.
+
+        Returns:
+            The usable reset token record. Its ``user_id`` is the sole
+            authority on which account the token belongs to.
+
+        Raises:
+            InvalidPasswordResetTokenError: If no stored digest matches.
+            ExpiredPasswordResetTokenError: If the token is past its expiry.
+            UsedPasswordResetTokenError: If the token was already consumed or
+                superseded by a newer token.
+        """
+        return self._resolve_password_reset_token(token, now=self._utcnow(), for_update=for_update)
+
+    def reset_password(self, token: str, new_password: str) -> None:
+        """Redeem a password-reset token and replace the account's password.
+
+        The stored record alone determines which account is reset, so no user
+        identifier is accepted from the caller and a token can never be redeemed
+        against a different account. The new password is bcrypt-hashed here and
+        is never stored in plaintext.
+
+        The password update, the token consumption, and the clearing of
+        lockout state are committed as one transaction: if any part fails,
+        everything is rolled back and the token remains usable. ``last_login_at``
+        is deliberately not touched and no access or refresh token is issued,
+        because a password reset is not a login; the user authenticates normally
+        afterwards.
+
+        Args:
+            token: The raw reset token as delivered to the user.
+            new_password: The new plaintext password.
+
+        Raises:
+            InvalidPasswordResetTokenError: If the token matches no stored
+                digest, or its account no longer exists or is inactive.
+            ExpiredPasswordResetTokenError: If the token is past its expiry.
+            UsedPasswordResetTokenError: If the token was already consumed or
+                superseded by a newer token.
+        """
+        now = self._utcnow()
+
+        # The whole operation is transactional, so the rollback handler must span
+        # every step that can fail. Token resolution takes the token row lock and
+        # password hashing can raise, so both sit inside the ``try``; otherwise an
+        # early failure would escape without rolling back and would leave the lock
+        # held until the session is closed.
+        try:
+            record = self._resolve_password_reset_token(token, now=now, for_update=True)
+
+            # Hashed after the token row lock but before the user row is locked, so
+            # bcrypt's cost is never paid while holding that lock. A rejected
+            # password therefore also never reaches the writes below and can never
+            # consume the token.
+            new_password_hash = hash_password(new_password)
+
+            user = self._repository.get_by_id(record.user_id, for_update=True)
+            if user is None or not user.is_active:
+                raise InvalidPasswordResetTokenError()
+            self._repository.update_password(user, new_password_hash)
+            self._repository.update_authentication_state(
+                user,
+                failed_login_attempts=0,
+                locked_until=None,
+            )
+            self._reset_token_repository.mark_used(record, now)
+            self._db.commit()
+        except Exception:
+            self._db.rollback()
+            raise
+
+    def _resolve_password_reset_token(
+        self, token: str, *, now: datetime, for_update: bool
+    ) -> PasswordResetToken:
+        """Return the usable reset token matching the submitted token.
+
+        Shared by the public validation method and by the reset operation so
+        both apply exactly the same lookup and state rules. Expiry is compared
+        against ``expires_at`` as a timezone-aware instant; a token whose expiry
+        has just passed is already unusable.
+        """
+        record = self._reset_token_repository.get_by_token_hash(
+            hash_password_reset_token(token), for_update=for_update
+        )
+        if record is None:
+            raise InvalidPasswordResetTokenError()
+        if record.used_at is not None:
+            raise UsedPasswordResetTokenError()
+        if record.expires_at <= now:
+            raise ExpiredPasswordResetTokenError()
+        return record
 
     @staticmethod
     def _is_duplicate_email(error: IntegrityError) -> bool:
