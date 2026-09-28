@@ -18,6 +18,7 @@ from app.core.exceptions import (
     InvalidCredentialsError,
     InvalidTokenError,
     InvalidTokenTypeError,
+    PasswordResetError,
 )
 from app.core.tokens import (
     create_access_token,
@@ -34,12 +35,21 @@ from app.modules.auth.dependencies import get_auth_service, get_current_user
 from app.modules.auth.models import User
 from app.modules.auth.schemas import (
     AuthenticatedUserResponse,
+    ForgotPasswordRequest,
+    MessageResponse,
+    ResetPasswordRequest,
     UserLoginRequest,
     UserRegistrationRequest,
 )
 from app.modules.auth.service import AuthService
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+FORGOT_PASSWORD_MESSAGE = (
+    "If an account exists for this email, a password reset link has been sent."
+)
+RESET_PASSWORD_MESSAGE = "Password has been reset successfully."
+INVALID_RESET_TOKEN_DETAIL = "Invalid or expired password reset token."
 
 
 @router.post(
@@ -250,3 +260,83 @@ def me(user: User = Depends(get_current_user)) -> AuthenticatedUserResponse:
         The safe authenticated-user profile.
     """
     return AuthenticatedUserResponse.model_validate(user)
+
+
+@router.post(
+    "/forgot-password",
+    response_model=MessageResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Request a password reset link",
+)
+def forgot_password(
+    request: ForgotPasswordRequest,
+    service: AuthService = Depends(get_auth_service),
+) -> MessageResponse:
+    """Start the password-reset flow for an email address.
+
+    The endpoint is deliberately unauthenticated and deliberately uniform: the
+    service returns ``None`` for an unknown address and a raw token for a known
+    one, and both produce the same 200 response with the same body. A caller
+    therefore cannot use this endpoint to confirm that an account exists.
+
+    The raw token the service returns is discarded here and never placed in the
+    response, logged, or attached to an exception. Delivering it to the user is
+    the email layer's job, which is not part of this step.
+
+    Args:
+        request: Forgot-password payload carrying only the email address.
+        service: AuthService that issues the reset token when the account
+            exists.
+
+    Returns:
+        The generic message that is identical for every valid request.
+    """
+    # Return value intentionally ignored: the token is the email layer's to
+    # deliver, and the HTTP layer must never disclose it.
+    service.create_password_reset_token(str(request.email))
+    return MessageResponse(message=FORGOT_PASSWORD_MESSAGE)
+
+
+@router.post(
+    "/reset-password",
+    response_model=MessageResponse,
+    status_code=status.HTTP_200_OK,
+    responses={
+        status.HTTP_401_UNAUTHORIZED: {"description": INVALID_RESET_TOKEN_DETAIL},
+    },
+    summary="Redeem a password reset token",
+)
+def reset_password(
+    request: ResetPasswordRequest,
+    service: AuthService = Depends(get_auth_service),
+) -> MessageResponse:
+    """Redeem a password-reset token and set a new password.
+
+    The opaque token is the only credential accepted; no user id may accompany
+    it, so the token record alone selects the account. The endpoint issues no
+    access or refresh token and sets no cookie, because a password reset is not
+    a login: the user authenticates with the new password afterwards.
+
+    Every password-reset domain error collapses into one indistinguishable 401,
+    so a caller cannot learn whether the token was unknown, expired, already
+    used, or which account it belonged to.
+
+    Args:
+        request: Reset-password payload with the token and the new password.
+        service: AuthService that redeems the token and rotates the password.
+
+    Returns:
+        The generic success message; the token is never echoed back.
+
+    Raises:
+        HTTPException: 401 for any unusable reset token.
+    """
+    try:
+        service.reset_password(request.token, request.new_password)
+    except PasswordResetError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=INVALID_RESET_TOKEN_DETAIL,
+        ) from exc
+
+    return MessageResponse(message=RESET_PASSWORD_MESSAGE)

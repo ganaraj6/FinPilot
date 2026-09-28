@@ -1,4 +1,4 @@
-"""Tests for the auth HTTP router (registration and login).
+"""Tests for the auth HTTP router (registration, login, and password reset).
 
 The router is tested end to end through Starlette's TestClient with the real
 ``get_auth_service`` dependency overridden by a fake, so no database is touched.
@@ -6,6 +6,9 @@ The fake asserts that the router stays thin: requests are forwarded verbatim
 (normalization belongs to the service) and the router delegates to the service.
 Login additionally verifies the HttpOnly-cookie delivery of the access and
 refresh tokens and the mapping of authentication errors to HTTP status codes.
+The password-reset endpoints additionally verify that the opaque reset token is
+never returned, logged, or leaked through an error, and that
+``/forgot-password`` cannot be used to confirm that an account exists.
 
 The real ``app.main.app`` is imported so prefix composition (``/api/v1``) and
 router mounting are exercised exactly as in production.
@@ -17,6 +20,8 @@ router mounting are exercised exactly as in production.
 # ruff: noqa: E402
 
 import importlib.util
+import json
+import logging
 import os
 import sys
 import unittest
@@ -34,8 +39,11 @@ from app.config.settings import get_settings
 from app.core.exceptions import (
     AccountLockedError,
     EmailAlreadyRegisteredError,
+    ExpiredPasswordResetTokenError,
     InactiveAccountError,
     InvalidCredentialsError,
+    InvalidPasswordResetTokenError,
+    UsedPasswordResetTokenError,
 )
 from app.core.tokens import (
     TokenType,
@@ -47,6 +55,7 @@ from app.core.tokens import (
 from app.main import app
 from app.modules.auth.cookies import ACCESS_TOKEN_COOKIE, REFRESH_TOKEN_COOKIE
 from app.modules.auth.dependencies import get_current_user
+from app.modules.auth.repository import PasswordResetTokenRepository
 from app.modules.auth.router import get_auth_service
 from app.modules.auth.schemas import AuthenticatedUserResponse
 from app.modules.auth.service import AuthService
@@ -1250,6 +1259,466 @@ class GetMeEndpointTests(unittest.TestCase):
             inspect.getmodule(get_auth_service),
             deps_mod,
         )
+
+
+FORGOT_PASSWORD_PATH = "/api/v1/auth/forgot-password"
+RESET_PASSWORD_PATH = "/api/v1/auth/reset-password"
+
+# Stand-in for the opaque token the real service would hand to the email layer.
+# It is a recognisable string so a leak would be caught, and every assertion
+# below reports a fixed message rather than echoing it, so a failure never
+# prints the token either.
+_FAKE_RESET_TOKEN = "opaque-reset-token-must-never-be-disclosed"
+
+_FORGOT_PASSWORD_PAYLOAD = {"email": "user@example.com"}
+_RESET_PASSWORD_PAYLOAD = {
+    "token": _FAKE_RESET_TOKEN,
+    "new_password": "NewPassword123!",
+}
+
+_EXPECTED_FORGOT_PASSWORD_BODY = {
+    "message": "If an account exists for this email, a password reset link has been sent."
+}
+_EXPECTED_RESET_PASSWORD_BODY = {"message": "Password has been reset successfully."}
+_EXPECTED_INVALID_TOKEN_BODY = {"detail": "Invalid or expired password reset token."}
+
+
+class FakePasswordResetAuthService:
+    """AuthService stand-in exposing only the two reset methods the router calls.
+
+    The fake deliberately has no ``login`` method, so any attempt by the router
+    to log the user in as part of a reset fails loudly instead of passing
+    unnoticed.
+    """
+
+    def __init__(self, *, known_emails=None, reset_error=None, token=_FAKE_RESET_TOKEN):
+        """Configure which emails exist and which error the reset should raise."""
+        self.known_emails = set(known_emails or ())
+        self.reset_error = reset_error
+        self.token = token
+        self.forgot_calls: list = []
+        self.reset_calls: list = []
+        self.issued_tokens: list = []
+
+    def create_password_reset_token(self, email):
+        """Return a raw token for a known address and None for an unknown one."""
+        self.forgot_calls.append(email)
+        if email not in self.known_emails:
+            return None
+        self.issued_tokens.append(self.token)
+        return self.token
+
+    def reset_password(self, token, new_password):
+        """Record the call, then honor the configured error."""
+        self.reset_calls.append((token, new_password))
+        if self.reset_error is not None:
+            raise self.reset_error
+
+
+@unittest.skipUnless(_HAS_HTTP_CLIENT, "httpx2 (or httpx) is required for TestClient")
+class _PasswordResetTestCase(unittest.TestCase):
+    """Shared wiring for the password-reset HTTP tests."""
+
+    known_emails = ()
+
+    def setUp(self) -> None:
+        """Wire the fake service into the app and create a test client."""
+        self.service = FakePasswordResetAuthService(known_emails=self.known_emails)
+        self.previous_override = app.dependency_overrides.get(get_auth_service)
+        app.dependency_overrides[get_auth_service] = lambda: self.service
+        self.client = TestClient(app, raise_server_exceptions=False)
+
+    def tearDown(self) -> None:
+        """Restore the original dependency override state."""
+        if self.previous_override is None:
+            app.dependency_overrides.pop(get_auth_service, None)
+        else:
+            app.dependency_overrides[get_auth_service] = self.previous_override
+
+    def assertTokenAbsent(self, response):
+        """Assert the raw reset token appears nowhere in the response.
+
+        ``assertFalse`` is used with a fixed message on purpose: a failure then
+        reports only that a leak occurred, not the leaked token.
+        """
+        self.assertFalse(
+            self.service.token in response.text,
+            "the raw reset token must never appear in an HTTP response",
+        )
+
+
+class ForgotPasswordEndpointTests(_PasswordResetTestCase):
+    """POST /api/v1/auth/forgot-password HTTP behaviour."""
+
+    known_emails = ("user@example.com",)
+
+    def test_known_email_returns_200(self):
+        """A request for an existing account returns 200 OK."""
+        response = self.client.post(FORGOT_PASSWORD_PATH, json=_FORGOT_PASSWORD_PAYLOAD)
+
+        self.assertEqual(response.status_code, 200)
+
+    def test_known_email_returns_generic_message(self):
+        """The body is the generic message that does not confirm the account."""
+        response = self.client.post(FORGOT_PASSWORD_PATH, json=_FORGOT_PASSWORD_PAYLOAD)
+
+        self.assertEqual(response.json(), _EXPECTED_FORGOT_PASSWORD_BODY)
+
+    def test_known_email_does_not_return_the_raw_token(self):
+        """The token the service produced is never echoed to the caller."""
+        self.assertEqual(len(self.service.issued_tokens), 0)
+
+        response = self.client.post(FORGOT_PASSWORD_PATH, json=_FORGOT_PASSWORD_PAYLOAD)
+
+        self.assertEqual(len(self.service.issued_tokens), 1)
+        self.assertTokenAbsent(response)
+        self.assertNotIn("token", response.json())
+
+    def test_unknown_email_returns_the_identical_response(self):
+        """An unknown address produces the same status and the same body."""
+        known = self.client.post(FORGOT_PASSWORD_PATH, json=_FORGOT_PASSWORD_PAYLOAD)
+        unknown = self.client.post(FORGOT_PASSWORD_PATH, json={"email": "nobody@example.com"})
+
+        self.assertEqual(unknown.status_code, known.status_code)
+        self.assertEqual(unknown.json(), known.json())
+
+    def test_response_does_not_reveal_account_existence(self):
+        """Nothing in the known-address response hints that the account exists.
+
+        The service actually issued a token for the known address, so the
+        difference in behaviour is confined to the service: the wire response
+        is byte-for-byte the same.
+        """
+        known = self.client.post(FORGOT_PASSWORD_PATH, json=_FORGOT_PASSWORD_PAYLOAD)
+        unknown = self.client.post(FORGOT_PASSWORD_PATH, json={"email": "nobody@example.com"})
+
+        self.assertEqual(self.service.issued_tokens, [self.service.token])
+        self.assertEqual(known.text, unknown.text)
+
+    def test_service_receives_the_email(self):
+        """The router forwards the parsed email to the service."""
+        self.client.post(FORGOT_PASSWORD_PATH, json=_FORGOT_PASSWORD_PAYLOAD)
+
+        self.assertEqual(self.service.forgot_calls, ["user@example.com"])
+
+    def test_email_is_forwarded_as_parsed_by_schema(self):
+        """Pydantic's parsing is applied; full normalization stays in the service."""
+        self.client.post(FORGOT_PASSWORD_PATH, json={"email": "  User@Example.COM  "})
+
+        self.assertEqual(self.service.forgot_calls, ["User@example.com"])
+
+    def test_malformed_email_returns_422(self):
+        """A syntactically invalid email fails schema validation with 422."""
+        response = self.client.post(FORGOT_PASSWORD_PATH, json={"email": "not-an-email"})
+
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(self.service.forgot_calls, [])
+
+    def test_missing_email_returns_422(self):
+        """An empty body fails schema validation with 422."""
+        response = self.client.post(FORGOT_PASSWORD_PATH, json={})
+
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(self.service.forgot_calls, [])
+
+    def test_requires_no_authentication(self):
+        """The endpoint works with no cookies and no Authorization header."""
+        response = self.client.post(FORGOT_PASSWORD_PATH, json=_FORGOT_PASSWORD_PAYLOAD)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(_cookie_map(response), {})
+
+    def test_does_not_set_any_cookie(self):
+        """A reset request never sets a session cookie."""
+        response = self.client.post(FORGOT_PASSWORD_PATH, json=_FORGOT_PASSWORD_PAYLOAD)
+
+        self.assertEqual(_cookie_map(response), {})
+
+    def test_does_not_log_the_token(self):
+        """Nothing the endpoint emits puts the token in the logs."""
+        records: list = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record):
+                records.append(record.getMessage())
+
+        handler = _Capture()
+        root = logging.getLogger()
+        previous_level = root.level
+        root.addHandler(handler)
+        root.setLevel(logging.DEBUG)
+        try:
+            self.client.post(FORGOT_PASSWORD_PATH, json=_FORGOT_PASSWORD_PAYLOAD)
+        finally:
+            root.removeHandler(handler)
+            root.setLevel(previous_level)
+
+        self.assertEqual(len(self.service.issued_tokens), 1)
+        self.assertFalse(
+            any(self.service.token in message for message in records),
+            "the raw reset token must never be logged",
+        )
+
+    def test_route_is_mounted_with_api_prefix(self):
+        """The forgot-password route is reachable at the composed /api/v1 path."""
+        self.assertIn(FORGOT_PASSWORD_PATH, app.openapi()["paths"])
+
+    def test_route_only_accepts_post(self):
+        """The forgot-password route exposes only the POST method."""
+        path_spec = app.openapi()["paths"][FORGOT_PASSWORD_PATH]
+        self.assertEqual(set(path_spec), {"post"})
+
+
+class ResetPasswordEndpointTests(_PasswordResetTestCase):
+    """POST /api/v1/auth/reset-password HTTP behaviour."""
+
+    def test_valid_token_returns_200(self):
+        """A redeemable token returns 200 OK."""
+        response = self.client.post(RESET_PASSWORD_PATH, json=_RESET_PASSWORD_PAYLOAD)
+
+        self.assertEqual(response.status_code, 200)
+
+    def test_valid_token_returns_success_message(self):
+        """The body is the generic success message."""
+        response = self.client.post(RESET_PASSWORD_PATH, json=_RESET_PASSWORD_PAYLOAD)
+
+        self.assertEqual(response.json(), _EXPECTED_RESET_PASSWORD_BODY)
+
+    def test_valid_token_delegates_to_service(self):
+        """The router forwards the token and new password to the service."""
+        self.client.post(RESET_PASSWORD_PATH, json=_RESET_PASSWORD_PAYLOAD)
+
+        self.assertEqual(
+            self.service.reset_calls,
+            [(_FAKE_RESET_TOKEN, "NewPassword123!")],
+        )
+
+    def test_token_is_never_returned(self):
+        """The consumed token never comes back in the response."""
+        response = self.client.post(RESET_PASSWORD_PATH, json=_RESET_PASSWORD_PAYLOAD)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTokenAbsent(response)
+        self.assertEqual(set(response.json()), {"message"})
+
+    def test_does_not_set_any_cookie(self):
+        """A reset is not a login, so no session cookie is issued."""
+        response = self.client.post(RESET_PASSWORD_PATH, json=_RESET_PASSWORD_PAYLOAD)
+
+        self.assertEqual(_cookie_map(response), {})
+
+    def test_requires_no_authentication(self):
+        """The endpoint works with no cookies and no Authorization header."""
+        response = self.client.post(RESET_PASSWORD_PATH, json=_RESET_PASSWORD_PAYLOAD)
+
+        self.assertEqual(response.status_code, 200)
+
+    def test_user_id_cannot_select_the_account(self):
+        """A user id in the body is ignored; the service takes only the token.
+
+        ``reset_password`` is the sole account selector, so the router has no
+        way to pass an identifier through even if the body carried one.
+        """
+        response = self.client.post(
+            RESET_PASSWORD_PATH,
+            json={**_RESET_PASSWORD_PAYLOAD, "user_id": str(uuid.uuid4())},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(self.service.reset_calls), 1)
+        self.assertEqual(len(self.service.reset_calls[0]), 2)
+
+    def test_invalid_token_returns_401(self):
+        """An unknown token maps to a 401 response."""
+        self.service.reset_error = InvalidPasswordResetTokenError()
+
+        response = self.client.post(RESET_PASSWORD_PATH, json=_RESET_PASSWORD_PAYLOAD)
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_expired_token_returns_401(self):
+        """An expired token maps to a 401 response."""
+        self.service.reset_error = ExpiredPasswordResetTokenError()
+
+        response = self.client.post(RESET_PASSWORD_PATH, json=_RESET_PASSWORD_PAYLOAD)
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_used_token_returns_401(self):
+        """An already-consumed token maps to a 401 response."""
+        self.service.reset_error = UsedPasswordResetTokenError()
+
+        response = self.client.post(RESET_PASSWORD_PATH, json=_RESET_PASSWORD_PAYLOAD)
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_all_rejections_share_one_indistinguishable_body(self):
+        """Unknown, expired, and used tokens produce byte-identical responses."""
+        bodies = set()
+        for error in (
+            InvalidPasswordResetTokenError(),
+            ExpiredPasswordResetTokenError(),
+            UsedPasswordResetTokenError(),
+        ):
+            self.service.reset_error = error
+            response = self.client.post(RESET_PASSWORD_PATH, json=_RESET_PASSWORD_PAYLOAD)
+            self.assertEqual(response.status_code, 401)
+            bodies.add(response.text)
+
+        self.assertEqual(
+            bodies,
+            {json.dumps(_EXPECTED_INVALID_TOKEN_BODY, separators=(",", ":"))},
+        )
+
+    def test_rejection_does_not_leak_the_token(self):
+        """The error response never echoes the submitted token."""
+        self.service.reset_error = InvalidPasswordResetTokenError()
+
+        response = self.client.post(RESET_PASSWORD_PATH, json=_RESET_PASSWORD_PAYLOAD)
+
+        self.assertEqual(response.status_code, 401)
+        self.assertTokenAbsent(response)
+
+    def test_rejection_body_exposes_no_internal_detail(self):
+        """The 401 body names no failure reason and no account information."""
+        self.service.reset_error = ExpiredPasswordResetTokenError()
+
+        response = self.client.post(RESET_PASSWORD_PATH, json=_RESET_PASSWORD_PAYLOAD)
+
+        body = response.json()
+        self.assertEqual(body, _EXPECTED_INVALID_TOKEN_BODY)
+        self.assertNotIn("expired", response.text.lower().replace("expired password", ""))
+        self.assertNotIn("user", response.text.lower())
+        self.assertNotIn("token_hash", response.text)
+
+    def test_missing_token_returns_422(self):
+        """A body without a token fails schema validation with 422."""
+        response = self.client.post(RESET_PASSWORD_PATH, json={"new_password": "NewPassword123!"})
+
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(self.service.reset_calls, [])
+
+    def test_missing_new_password_returns_422(self):
+        """A body without a new password fails schema validation with 422."""
+        response = self.client.post(RESET_PASSWORD_PATH, json={"token": _FAKE_RESET_TOKEN})
+
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(self.service.reset_calls, [])
+
+    def test_empty_body_returns_422(self):
+        """An empty body fails schema validation with 422."""
+        response = self.client.post(RESET_PASSWORD_PATH, json={})
+
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(self.service.reset_calls, [])
+
+    def test_oversized_password_returns_422(self):
+        """A password past bcrypt's byte limit is rejected before hashing.
+
+        Without this the limit would only surface as a hashing error inside the
+        service, which would leak a 500 instead of a client mistake.
+        """
+        response = self.client.post(
+            RESET_PASSWORD_PATH,
+            json={"token": _FAKE_RESET_TOKEN, "new_password": "a" * 73},
+        )
+
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(self.service.reset_calls, [])
+
+    def test_unexpected_service_error_is_not_a_401(self):
+        """A non-domain failure surfaces as a 500 rather than a generic 401."""
+        self.service.reset_error = RuntimeError("boom")
+
+        response = self.client.post(RESET_PASSWORD_PATH, json=_RESET_PASSWORD_PAYLOAD)
+
+        self.assertEqual(response.status_code, 500)
+
+    def test_unexpected_error_does_not_leak_the_token(self):
+        """Even a 500 body does not carry the submitted token."""
+        self.service.reset_error = RuntimeError("boom")
+
+        response = self.client.post(RESET_PASSWORD_PATH, json=_RESET_PASSWORD_PAYLOAD)
+
+        self.assertEqual(response.status_code, 500)
+        self.assertTokenAbsent(response)
+
+    def test_route_is_mounted_with_api_prefix(self):
+        """The reset-password route is reachable at the composed /api/v1 path."""
+        self.assertIn(RESET_PASSWORD_PATH, app.openapi()["paths"])
+
+    def test_route_only_accepts_post(self):
+        """The reset-password route exposes only the POST method."""
+        path_spec = app.openapi()["paths"][RESET_PASSWORD_PATH]
+        self.assertEqual(set(path_spec), {"post"})
+
+
+class PasswordResetRouterArchitectureTests(unittest.TestCase):
+    """Router-thinness and dependency-wiring guarantees (no HTTP client needed)."""
+
+    def _router_source(self) -> str:
+        import inspect
+
+        from app.modules.auth import router as router_mod
+
+        return inspect.getsource(router_mod)
+
+    def test_router_does_not_generate_reset_tokens(self):
+        """Token generation belongs to the core utilities, not the router."""
+        source = self._router_source()
+
+        self.assertNotIn("generate_password_reset_token", source)
+        self.assertNotIn("hash_password_reset_token", source)
+
+    def test_router_does_not_hash_or_verify_passwords(self):
+        """Password hashing belongs to the service, not the router."""
+        source = self._router_source()
+
+        self.assertNotIn("hash_password(", source)
+        self.assertNotIn("verify_password(", source)
+
+    def test_router_queries_no_repository(self):
+        """The router performs no database work of its own."""
+        source = self._router_source()
+
+        self.assertNotIn("select(", source)
+        self.assertNotIn(".scalar(", source)
+        self.assertNotIn("session.query", source)
+
+    def test_reset_endpoints_do_not_require_the_current_user(self):
+        """Neither reset endpoint depends on the authenticated-user dependency."""
+        import inspect
+
+        from app.modules.auth import router as router_mod
+
+        for handler in (router_mod.forgot_password, router_mod.reset_password):
+            with self.subTest(handler=handler.__name__):
+                params = inspect.signature(handler).parameters
+                self.assertNotIn("user", params)
+                for param in params.values():
+                    dependency = getattr(param.default, "dependency", None)
+                    self.assertIsNot(dependency, get_current_user)
+
+    def test_get_auth_service_supplies_the_reset_token_repository(self):
+        """The existing dependency factory already wires Step 7A's repository.
+
+        ``AuthService`` defaults its reset-token repository to one bound to the
+        same session, so the router needed no dependency change.
+        """
+        db = object()
+
+        service = get_auth_service(db)
+
+        self.assertIsInstance(service._reset_token_repository, PasswordResetTokenRepository)
+
+    def test_service_exposes_only_the_expected_reset_methods(self):
+        """The router's collaborators are the public reset methods."""
+        import inspect
+
+        self.assertTrue(hasattr(AuthService, "create_password_reset_token"))
+        self.assertTrue(hasattr(AuthService, "reset_password"))
+        parameters = list(inspect.signature(AuthService.reset_password).parameters)
+        self.assertEqual(parameters, ["self", "token", "new_password"])
 
 
 if __name__ == "__main__":
